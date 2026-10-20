@@ -18,7 +18,6 @@ using namespace layout;
 
 namespace d3d {
 void ViewScale(float xy);
-void NearDepth(float plane);
 }
 
 namespace {
@@ -102,7 +101,10 @@ void AfterCreateDevice(X86Context& ctx, uint8_t* base) {
 
 constexpr uint32_t kFrameCount = 0x2F4368;
 
-// seconds the last frame took, the frame time the game was made for at most
+// the game speed cheat: the game's steps take this share of the real time
+static float Speed() { return float(std::clamp(game::Opt().game_speed, 25u, 200u)) / 100.0f; }
+
+// seconds the last frame took, the frame time the game was made for at most, at the game speed
 static float FrameTime() {
     using clock = std::chrono::steady_clock;
     static clock::time_point last;
@@ -114,7 +116,7 @@ static float FrameTime() {
         frame = f;
         last = now;
     }
-    return dt;
+    return dt * Speed();
 }
 
 // The game's timers step one fixed frame time a frame: they step the real one, so any frame rate plays at speed
@@ -151,8 +153,12 @@ void MenuTick(X86Context& ctx, uint8_t*) {
 // what a step made once a frame at 30 becomes over the real frame: factor to the power of this
 static float FrameShare() { return FrameTime() / G<float>(kGameFrameTime); }
 
-// weapon
+static uint32_t Player() { return R32(kWorld) + kWorldPlayer; }
+
+// weapon and its data
+constexpr uint32_t kWeaponData = 0xEC;
 constexpr uint32_t kWeaponOwner = 0xF0;
+constexpr uint32_t kDataAimZoom = 0xB4;
 // player
 constexpr uint32_t kPlayerForward = 0xF0;
 constexpr uint32_t kPlayerEye = 0x100;
@@ -171,11 +177,10 @@ void ZoomStep(X86Context& ctx, uint8_t*) {
 }
 
 constexpr float kHalf = 3.14159265f / 360.0f;
-constexpr uint32_t kGameFov = 70;  // the view's and the viewmodel's
 
-// tangent of a setting's half angle over that of the game's
+// tangent of a setting's half angle over that of the game's 70 degrees
 static float Widen(uint32_t degrees) {
-    return std::tan(std::clamp(degrees, 45u, 140u) * kHalf) / std::tan(kGameFov * kHalf);
+    return std::tan(std::clamp(degrees, 45u, 140u) * kHalf) / std::tan(70 * kHalf);
 }
 
 static float g_gun = 1.0f;  // the gun's picture over the view's
@@ -193,23 +198,14 @@ void FieldOfView(X86Context& ctx, uint8_t*) {
     if (view != 1) fov = std::atan(std::tan(fov * kHalf) * view) / kHalf;
 }
 
-constexpr float kNearPlane = 0.08f;  // every camera's, set once at renderer init
-
-// The list of the first person models, gun, arms and muzzle mesh: drawn at the viewmodel setting.
-// Wider than the game's 70 it shows parts nearer than the near plane, which are kept
+// The list of the first person models, gun, arms and muzzle mesh: drawn at the viewmodel setting
 X86_EXTERN_FUNC(__imp__sub_00176F60);
 X86_FUNC(sub_00176F60) {
-    bool list = ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
-    bool scale = list && g_gun != 1;
-    bool keep_near = list && game::Opt().viewmodel_fov > kGameFov;
-    if (scale) d3d::ViewScale(g_gun);
-    if (keep_near) d3d::NearDepth(kNearPlane);
+    bool gun = g_gun != 1 && ctx.esi == R32(kDisplay) + kDisplayDrawLists + kGunDrawList * kDrawListSize;
+    if (gun) d3d::ViewScale(g_gun);
     __imp__sub_00176F60(ctx, base);
-    if (scale) d3d::ViewScale(1);
-    if (keep_near) d3d::NearDepth(0);
+    if (gun) d3d::ViewScale(1);
 }
-
-static uint32_t Player() { return R32(kWorld) + kWorldPlayer; }
 
 // What sits on the gun follows its picture: across the player's view a point or an axis grows by the same share,
 // its depth stays
@@ -273,8 +269,12 @@ X86_FUNC(sub_001D2860) {
     if (g_gun != 1 && (from == kFromTracerA || from == kFromTracerB)) OnGun(out + kMatrixPosition, true);
 }
 
-// recoil dies away by a factor a frame
-void RecoilDecay(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] = std::pow(ctx.xmm[0].f[0], FrameShare()); }
+// Recoil dies away by a factor a frame. ebx the player: the kick a shot leaves (0x1EFE58) is spent here before
+// it reaches the view, the cheat makes it nothing
+void RecoilDecay(X86Context& ctx, uint8_t*) {
+    bool none = game::Opt().no_recoil && ctx.ebx == Player();
+    ctx.xmm[0].f[0] = none ? 0.0f : std::pow(ctx.xmm[0].f[0], FrameShare());
+}
 
 constexpr uint32_t kDataSwayShares = 0x104;
 
@@ -295,9 +295,6 @@ void SwayEnd(X86Context&, uint8_t*) {
     g_sway = 0;
 }
 
-// The player's move speed eases to the stick's by at most a fixed step a frame: the step of a frame at 30
-void MoveEase(X86Context& ctx, uint8_t*) { ctx.xmm[1].f[0] *= FrameShare(); }
-
 static float Dt() { return G<float>(R32(kWorld) + kTimerDt); }
 
 // A wait set and tested once a frame lasts whole frames of the game's frame time: as many at any frame rate.
@@ -315,6 +312,39 @@ static bool g_idle_early;
 // weapon
 constexpr uint32_t kWeaponState = 0xD8;
 constexpr uint32_t kWeaponWait = 0xDC;
+constexpr uint32_t kWeaponAmmo = 0xF4;
+constexpr uint32_t kWeaponAltAmmo = 0xF8;  // the grenades under the barrel
+// ammo: a shot takes one from each (0x1EFBBB)
+constexpr uint32_t kAmmoTotal = 0x14;
+constexpr uint32_t kAmmoClip = 0x18;
+
+// the cheat: what the player's weapon had before its update, put back where it went down. A reload moves rounds
+// from the reserve to the magazine, the reserve is put back too
+struct KeptAmmo {
+    uint32_t ammo = 0;
+    uint32_t total = 0;
+    uint16_t clip = 0;
+};
+
+static KeptAmmo KeepAmmo(uint32_t weapon) {
+    uint32_t ammo = R32(weapon + kWeaponAmmo);
+    if (!game::Opt().infinite_ammo || !ammo || R32(weapon + kWeaponOwner) != Player()) return {};
+    return {ammo, R32(ammo + kAmmoTotal), G<uint16_t>(ammo + kAmmoClip)};
+}
+
+// the rounds a weapon has left in all: a shot of either barrel takes one (0x1EFBC5, 0x1EFEED)
+static uint32_t Rounds(uint32_t weapon) {
+    uint32_t rounds = 0;
+    for (uint32_t at : {kWeaponAmmo, kWeaponAltAmmo})
+        if (uint32_t ammo = R32(weapon + at)) rounds += R32(ammo + kAmmoTotal);
+    return rounds;
+}
+
+static void RestoreAmmo(uint32_t weapon, const KeptAmmo& kept) {
+    if (!kept.ammo || R32(weapon + kWeaponAmmo) != kept.ammo) return;
+    if (R32(kept.ammo + kAmmoTotal) < kept.total) W32(kept.ammo + kAmmoTotal, kept.total);
+    if (G<uint16_t>(kept.ammo + kAmmoClip) < kept.clip) G<uint16_t>(kept.ammo + kAmmoClip) = kept.clip;
+}
 
 // the wait between a weapon's shots. The frame of a first shot is part of it: the fire clip runs that frame too
 // and holds its next shot where the wait ends
@@ -324,8 +354,15 @@ X86_FUNC(sub_001EEFD0) {
     float& wait = G<float>(weapon + kWeaponWait);
     float rest = wait;
     float dt = Dt();
+    KeptAmmo kept = KeepAmmo(weapon);
+    uint32_t rounds = Rounds(weapon);
     __imp__sub_001EEFD0(ctx, base);
+    bool shot = Rounds(weapon) < rounds;
+    RestoreAmmo(weapon, kept);
     uint32_t me = R32(weapon + kWeaponOwner);
+    // the rapid fire cheat: a shot's wait, its fire mode's +0x20, is that many times shorter
+    uint32_t faster = std::clamp(game::Opt().rapid_fire, 1u, 4u);
+    if (shot && me == Player() && wait > 0) wait /= float(faster);
     if (me == Player()) {
         if (R32(weapon + kWeaponState) != 1 || wait != rest) g_idle_early = false;
         else if (g_idle_early) W32(me + kPlayerFireRequest, 0);  // the fire request is spent, as on the console
@@ -503,16 +540,6 @@ X86_FUNC(sub_001690D0) {
 }
 bool ShardTick(X86Context&, uint8_t*) { return g_shard_tick; }
 
-// The sound manager counts its glass shard sound slots (0x2AB27C) and four timers down once a call, made for 30 calls
-// a second: they count once a game frame, or shard sounds pile up at high frame rates
-bool SoundCountdownTick(X86Context&, uint8_t*) {
-    static float ticks;
-    ticks += FrameShare();
-    if (ticks < 1) return false;
-    ticks -= 1;
-    return true;
-}
-
 // xmm1 the gain of a shard's turn a frame
 void ShardSpinGain(X86Context& ctx, uint8_t*) { ctx.xmm[1].f[0] *= FrameShare(); }
 
@@ -529,7 +556,7 @@ void ShardStep(X86Context& ctx, uint8_t*) {
 
 // LOD and draw distances reach this many times farther: each compare sees a distance that much shorter or a
 // limit that much longer. Characters, props, pickups, ground cover, particles and bullet holes
-static float Reach() { return float(std::clamp(game::Opt().draw_distance, 1u, 16u)); }
+static float Reach() { return float(std::clamp(game::Opt().draw_distance, 1u, 8u)); }
 void DistanceShorter(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] /= Reach(); }
 void DistanceShorterSquared(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] /= Reach() * Reach(); }
 void LimitLonger(X86Context& ctx, uint8_t*) { ctx.xmm[0].f[0] *= Reach(); }
