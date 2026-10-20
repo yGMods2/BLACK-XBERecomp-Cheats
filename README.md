@@ -1,9 +1,10 @@
-# Black - XBE Recomp
+# Black - XBE Recomp Cheats
 An unofficial native PC port of the original Xbox version of Black, with extended graphics options, keyboard and mouse support, and other enhancements.
 
 This port was created using the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool.
 
 > [!NOTE]
+> This fork only add new options for cheats for game
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build.
 
 ## Installation
